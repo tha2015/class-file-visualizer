@@ -14,6 +14,55 @@ private fun String.escapeHtml(): String = this
     .replace("'", "&#39;")
 
 /**
+ * Decode method handle reference kind to human-readable string
+ * JVM Spec 5.4.3.5: The value of the reference_kind item must be in the range 1 to 9
+ */
+private fun UByte.decodeReferenceKind(): String {
+    val kind = when (this.toInt()) {
+        1 -> "REF_getField"
+        2 -> "REF_getStatic"
+        3 -> "REF_putField"
+        4 -> "REF_putStatic"
+        5 -> "REF_invokeVirtual"
+        6 -> "REF_invokeStatic"
+        7 -> "REF_invokeSpecial"
+        8 -> "REF_newInvokeSpecial"
+        9 -> "REF_invokeInterface"
+        else -> "UNKNOWN"
+    }
+    return "$this ($kind)"
+}
+
+/**
+ * Serialize a bootstrap method entry with its arguments
+ */
+private fun serializeBootstrapMethod(
+    bootstrapMethod: BootstrapMethod,
+    pool: List<ConstantPoolEntry?>,
+    bootstrapMethodsAttr: BootstrapMethodsAttribute?
+): JsonObject = buildJsonObject {
+    put("bootstrapMethodRef", bootstrapMethod.bootstrapMethodRef.toInt())
+    put("bootstrapMethodRef_deref", serializeConstantPoolEntry(
+        bootstrapMethod.bootstrapMethodRef.toInt(),
+        pool[bootstrapMethod.bootstrapMethodRef.toInt()],
+        pool,
+        bootstrapMethodsAttr
+    ))
+    put("numBootstrapArguments", bootstrapMethod.bootstrapArguments.size)
+    put("bootstrapArguments", JsonArray(bootstrapMethod.bootstrapArguments.map { argIndex ->
+        buildJsonObject {
+            put("argumentIndex", argIndex.toInt())
+            put("argumentIndex_deref", serializeConstantPoolEntry(
+                argIndex.toInt(),
+                pool[argIndex.toInt()],
+                pool,
+                bootstrapMethodsAttr
+            ))
+        }
+    }))
+}
+
+/**
  * Converts a ClassFile to JSON with inline dereferencing of constant pool entries.
  * Each u2 index field gets a corresponding *_deref field with the resolved entry.
  */
@@ -22,10 +71,13 @@ fun ClassFile.toJson(): JsonObject = buildJsonObject {
     put("minorVersion", minorVersion.toInt())
     put("majorVersion", majorVersion.toInt())
 
+    // Find BootstrapMethods attribute for dereferencing
+    val bootstrapMethods = attributes.filterIsInstance<BootstrapMethodsAttribute>().firstOrNull()
+
     // Constant Pool
     put("constantPoolCount", constantPool.size)
     put("constantPool", JsonArray(constantPool.mapIndexed { index, entry ->
-        if (entry == null) JsonNull else serializeConstantPoolEntry(index, entry, constantPool)
+        if (entry == null) JsonNull else serializeConstantPoolEntry(index, entry, constantPool, bootstrapMethods)
     }))
 
     // Access Flags
@@ -33,18 +85,18 @@ fun ClassFile.toJson(): JsonObject = buildJsonObject {
 
     // This Class
     put("thisClass", thisClass.toInt())
-    put("thisClass_deref", serializeConstantPoolEntry(thisClass.toInt(), constantPool[thisClass.toInt()], constantPool))
+    put("thisClass_deref", serializeConstantPoolEntry(thisClass.toInt(), constantPool[thisClass.toInt()], constantPool, bootstrapMethods))
 
     // Super Class
     put("superClass", superClass.toInt())
-    put("superClass_deref", serializeConstantPoolEntry(superClass.toInt(), constantPool[superClass.toInt()], constantPool))
+    put("superClass_deref", serializeConstantPoolEntry(superClass.toInt(), constantPool[superClass.toInt()], constantPool, bootstrapMethods))
 
     // Interfaces
     put("interfacesCount", interfaces.size)
     put("interfaces", JsonArray(interfaces.map { interfaceIndex ->
         buildJsonObject {
             put("index", interfaceIndex.toInt())
-            put("index_deref", serializeConstantPoolEntry(interfaceIndex.toInt(), constantPool[interfaceIndex.toInt()], constantPool))
+            put("index_deref", serializeConstantPoolEntry(interfaceIndex.toInt(), constantPool[interfaceIndex.toInt()], constantPool, bootstrapMethods))
         }
     }))
 
@@ -61,7 +113,12 @@ fun ClassFile.toJson(): JsonObject = buildJsonObject {
     put("attributes", JsonArray(attributes.map { it.toJson(constantPool) }))
 }
 
-private fun serializeConstantPoolEntry(index: Int, entry: ConstantPoolEntry?, pool: List<ConstantPoolEntry?>): JsonElement {
+private fun serializeConstantPoolEntry(
+    index: Int,
+    entry: ConstantPoolEntry?,
+    pool: List<ConstantPoolEntry?>,
+    bootstrapMethodsAttr: BootstrapMethodsAttribute? = null
+): JsonElement {
     if (entry == null) return JsonNull
 
     return buildJsonObject {
@@ -128,7 +185,7 @@ private fun serializeConstantPoolEntry(index: Int, entry: ConstantPoolEntry?, po
             }
             is ConstantMethodHandle -> {
                 put("tag", "CONSTANT_MethodHandle")
-                put("referenceKind", entry.referenceKind.toInt())
+                put("referenceKind", entry.referenceKind.decodeReferenceKind())
                 put("referenceIndex", entry.referenceIndex.toInt())
                 put("referenceIndex_deref", serializeConstantPoolEntry(entry.referenceIndex.toInt(), pool[entry.referenceIndex.toInt()], pool))
             }
@@ -140,8 +197,18 @@ private fun serializeConstantPoolEntry(index: Int, entry: ConstantPoolEntry?, po
             is ConstantInvokeDynamic -> {
                 put("tag", "CONSTANT_InvokeDynamic")
                 put("bootstrapMethodAttrIndex", entry.bootstrapMethodAttrIndex.toInt())
+                bootstrapMethodsAttr?.let { bsAttr ->
+                    val bsIndex = entry.bootstrapMethodAttrIndex.toInt()
+                    if (bsIndex < bsAttr.bootstrapMethods.size) {
+                        put("bootstrapMethodAttrIndex_deref", serializeBootstrapMethod(
+                            bsAttr.bootstrapMethods[bsIndex],
+                            pool,
+                            bootstrapMethodsAttr
+                        ))
+                    }
+                }
                 put("nameAndTypeIndex", entry.nameAndTypeIndex.toInt())
-                put("nameAndTypeIndex_deref", serializeConstantPoolEntry(entry.nameAndTypeIndex.toInt(), pool[entry.nameAndTypeIndex.toInt()], pool))
+                put("nameAndTypeIndex_deref", serializeConstantPoolEntry(entry.nameAndTypeIndex.toInt(), pool[entry.nameAndTypeIndex.toInt()], pool, bootstrapMethodsAttr))
             }
             is ConstantModule -> {
                 put("tag", "CONSTANT_Module")
@@ -156,8 +223,18 @@ private fun serializeConstantPoolEntry(index: Int, entry: ConstantPoolEntry?, po
             is ConstantDynamic -> {
                 put("tag", "CONSTANT_Dynamic")
                 put("bootstrapMethodAttrIndex", entry.bootstrapMethodAttrIndex.toInt())
+                bootstrapMethodsAttr?.let { bsAttr ->
+                    val bsIndex = entry.bootstrapMethodAttrIndex.toInt()
+                    if (bsIndex < bsAttr.bootstrapMethods.size) {
+                        put("bootstrapMethodAttrIndex_deref", serializeBootstrapMethod(
+                            bsAttr.bootstrapMethods[bsIndex],
+                            pool,
+                            bootstrapMethodsAttr
+                        ))
+                    }
+                }
                 put("nameAndTypeIndex", entry.nameAndTypeIndex.toInt())
-                put("nameAndTypeIndex_deref", serializeConstantPoolEntry(entry.nameAndTypeIndex.toInt(), pool[entry.nameAndTypeIndex.toInt()], pool))
+                put("nameAndTypeIndex_deref", serializeConstantPoolEntry(entry.nameAndTypeIndex.toInt(), pool[entry.nameAndTypeIndex.toInt()], pool, bootstrapMethodsAttr))
             }
         }
     }
@@ -279,17 +356,7 @@ private fun AttributeInfo.toJson(pool: List<ConstantPoolEntry?>): JsonObject = b
             put("attributeLength", 2 + bootstrapMethods.sumOf { 4 + it.bootstrapArguments.size * 2 })
             put("numBootstrapMethods", bootstrapMethods.size)
             put("bootstrapMethods", JsonArray(bootstrapMethods.map { method ->
-                buildJsonObject {
-                    put("bootstrapMethodRef", method.bootstrapMethodRef.toInt())
-                    put("bootstrapMethodRef_deref", serializeConstantPoolEntry(method.bootstrapMethodRef.toInt(), pool[method.bootstrapMethodRef.toInt()], pool))
-                    put("numBootstrapArguments", method.bootstrapArguments.size)
-                    put("bootstrapArguments", JsonArray(method.bootstrapArguments.map { argIndex ->
-                        buildJsonObject {
-                            put("argumentIndex", argIndex.toInt())
-                            put("argumentIndex_deref", serializeConstantPoolEntry(argIndex.toInt(), pool[argIndex.toInt()], pool))
-                        }
-                    }))
-                }
+                serializeBootstrapMethod(method, pool, null)
             }))
         }
         is InnerClassesAttribute -> {
